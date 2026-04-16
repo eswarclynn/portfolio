@@ -16,7 +16,7 @@ My personal portfolio — where I pretend to have my life together through clean
 
 - **Next.js 16** + React 19
 - **Tailwind CSS 4**
-- **Framer Motion** — for the animations that made my Mac fans spin (now optimized)
+- **Framer Motion** — smooth, GPU-friendly animations
 - **Lenis** — smooth scroll, because native scroll is for the weak
 - **MDX** — blog posts that mix prose and code
 
