@@ -1,0 +1,259 @@
+---
+title: "WebRTC in React Lingo: Declarative UI and State Management for Real-Time Video"
+date: "2021-07-20"
+description: "Video calls have more state than your average e-commerce app. Here's how we built a reactive, framework-agnostic store that let developers focus on what to render — not how to fetch it."
+tags: ["WebRTC", "React", "State Management", "SDK Design"]
+---
+
+Picture this. You're building a video call app. You've got the basics working — peers connect, video shows up, audio plays. Ship it, right?
+
+Then someone asks: "Can we show who's talking?" Sure. "Can we show when someone's muted?" Easy. "What about screen sharing? And a participant list? Oh, and network quality indicators on each tile. And dominant speaker detection. And—"
+
+Congratulations, you now have more state to manage than a mid-sized e-commerce checkout flow. Except this state changes 30 times a second, arrives from a WebSocket you don't control, and any lag is immediately visible as a frozen face on someone's screen.
+
+This is the story of how we went from callback spaghetti to a reactive store that made building video call UIs feel like building any other React app.
+
+## "Just Use Callbacks," They Said
+
+Every WebRTC tutorial starts the same way. You set up a peer connection, attach some event listeners, and boom — video appears. The "Hello World" of video calling takes about 50 lines of code and gives you the dangerous confidence that this whole thing is easy.
+
+Then reality shows up.
+
+A real video call isn't two people staring at each other in Chrome on a good WiFi connection. It's 50 people, some on phones, some on laptops from 2017, half of them on cellular data, one person screen sharing a 4K monitor, and someone's kid accidentally unmuting in the background.
+
+The typical WebRTC SDK gives you callbacks to handle all of this:
+
+```typescript
+sdk.on('peer-joined', (peer) => { /* update your list */ });
+sdk.on('peer-left', (peer) => { /* remove from list */ });
+sdk.on('track-added', (track, peer) => { /* attach to DOM */ });
+sdk.on('track-removed', (track, peer) => { /* detach from DOM */ });
+sdk.on('track-updated', (track, peer) => { /* re-render? maybe? */ });
+sdk.on('speaker-update', (speakers) => { /* who's talking now? */ });
+sdk.on('reconnecting', () => { /* show a spinner */ });
+sdk.on('reconnected', () => { /* hide the spinner, refresh state */ });
+```
+
+For a hackathon demo? This works great. For production? You're now writing a bespoke state management system for every app. And every developer using your SDK is writing a slightly different, slightly broken version of the same thing.
+
+I've seen apps where the video call component had 400+ lines of `useEffect` hooks, each one listening to a different callback, each one updating a different piece of state, and none of them agreeing on the current truth. Miss one event and your UI shows a ghost participant who left the call 30 seconds ago. Forget to clean up a listener and you've got a memory leak that only manifests after the 45-minute mark of a meeting.
+
+![A developer's component with 15 useEffect hooks, each managing a different WebRTC callback](/blog/callback-hell-meme.png)
+
+## The Shower Thought
+
+Here's what changed everything.
+
+I was looking at the sprawl of WebRTC callbacks one day and realized — if I ignored all the real-time complexity and just looked at the *shape* of the data, a video call's state at any moment is surprisingly simple:
+
+- **Peers**: a list of people in the room (name, role, metadata)
+- **Tracks**: audio and video streams, each belonging to a peer
+- **Speakers**: who's currently talking, ranked by volume
+- **Room**: is it recording? streaming? what's the connection state?
+- **Messages**: chat history
+
+That's it. That's a database. Or more precisely — that's a Redux store.
+
+And if video call state is just application state wearing a real-time costume... why are we asking every developer to manage it from scratch?
+
+## What If WebRTC Spoke React?
+
+The idea was to flip the entire model. Instead of "here are 47 events, good luck keeping your UI in sync," what if the SDK just maintained the state and let you read from it declaratively?
+
+```typescript
+// Before: imperative event wrangling
+sdk.on('peer-joined', (peer) => {
+  setPeers(prev => [...prev, peer]);
+});
+sdk.on('peer-left', (peer) => {
+  setPeers(prev => prev.filter(p => p.id !== peer.id));
+});
+sdk.on('track-updated', (track, peer) => {
+  // is this audio or video? the screenshare track? 
+  // did the peer already leave? what's happening?
+});
+
+// After: just... read the state
+const peers = useHMSStore(selectPeers);
+const isAudioOn = useHMSStore(selectIsLocalAudioEnabled);
+const dominantSpeaker = useHMSStore(selectDominantSpeaker);
+```
+
+No callbacks. No reconciliation. No "wait, is my local state out of sync with the SDK?" The store *is* the truth. Your component reads it. That's the contract.
+
+If you've ever used Zustand, Redux Toolkit, or even React Query — this should feel familiar. We just applied the same pattern to a domain where people assumed you *had* to think in events.
+
+## Under the Hood: Why This Is Harder Than It Looks
+
+Alright, let's peek behind the curtain. Making this *feel* simple required solving some genuinely hard problems.
+
+### The Re-render Apocalypse
+
+Video call state changes *constantly*. Audio levels update every 100ms. Network quality fluctuates every second. Peers join and leave. If you naively re-render on every state change, 20 peers in a call means:
+
+`20 peers × 5 state changes/second × N components = your UI is now a slideshow`
+
+The answer was **selectors** — functions that subscribe to exactly one slice of state:
+
+```typescript
+// This component ONLY re-renders when this specific peer's audio changes
+function AudioIndicator({ peerId }) {
+  const audioLevel = useHMSStore(selectPeerAudioByID(peerId));
+  return <div style={{ opacity: audioLevel / 100 }} />;
+}
+
+// This component ONLY re-renders when the peer count changes
+function ParticipantCount() {
+  const count = useHMSStore(selectPeerCount);
+  return <span>{count} in this call</span>;
+}
+```
+
+Peer #7's audio level changes? Only Peer #7's `AudioIndicator` re-renders. The other 19 don't even blink. This is the same principle behind Redux selectors or MobX observables, but when your state updates 200 times a second, it's the difference between a smooth call and a frozen tab.
+
+### Flat > Nested (Trust Me on This)
+
+Early on, nesting state felt natural. A peer *has* tracks. A track *has* stats. Why not model it that way?
+
+```typescript
+// Intuitive but disastrous
+{
+  peers: [{
+    id: 'peer-1',
+    tracks: [{
+      id: 'track-1',
+      stats: { bitrate: 500, packetsLost: 2 }
+    }]
+  }]
+}
+```
+
+The problem: when one track's bitrate updates, you have to create a new track object, inside a new peer object, inside a new peers array. Every selector that reads `peers` fires. For 20 peers with 2 tracks each, a single stat update cascades into re-renders everywhere.
+
+Normalizing the state — flat maps linked by IDs — made updates surgical:
+
+```typescript
+// Boring but correct
+{
+  peers: { 'peer-1': { name: 'Alice', trackIds: ['track-1', 'track-2'] } },
+  tracks: { 'track-1': { type: 'video', enabled: true } },
+  speakers: { 'peer-1': { audioLevel: 45 } }
+}
+```
+
+Update `speakers['peer-1'].audioLevel` and *only* the audio level selector fires. The peer list doesn't care. The track state doesn't care. It's boring, it's relational-database-101, and it saved us.
+
+### The Weird Stuff
+
+Here's a scenario that actually happens in production:
+
+> A peer joins with their camera off. Turns it on. Starts a screen share. Their network degrades. They switch from WiFi to cellular, triggering a reconnection. The screen share drops. The camera stays on. Their role changes mid-reconnection because the host promoted them to a speaker.
+
+Every one of those transitions is a state change. Tracks appear, disappear, change properties. Connection quality drops. A reconnection fires and some tracks need to be re-attached to DOM elements.
+
+With the store model, the component rendering that peer's tile doesn't know *any* of this is happening. It sees `videoTrack.enabled` go from `false` to `true`, then a second track appear, then `connectionQuality` drop. It re-renders accordingly. The reconnection, the role change, the track re-attachment — all handled internally. The component's code doesn't change.
+
+## The Framework-Agnostic Bet
+
+Here's a decision we made early that paid off big: the store was built in **vanilla JavaScript**. No React. No framework dependencies. Just a plain observable store with selectors.
+
+Why? Because our users weren't all React developers. Some used Svelte. Some used vanilla JS. Some were building Electron apps. One team was using Vue. If the core logic was coupled to React, we'd have to rewrite it for every framework — or tell half our users to go away.
+
+The architecture ended up looking like this:
+
+```
+┌─────────────────────────────────────┐
+│         Framework Bindings          │
+│  React Hooks  │  Svelte Store  │ JS │
+├─────────────────────────────────────┤
+│       Reactive Store (vanilla)      │
+│   Selectors, Subscriptions, State   │
+├─────────────────────────────────────┤
+│          Core SDK (vanilla)         │
+│  WebRTC, Signalling, Media, Stats   │
+└─────────────────────────────────────┘
+```
+
+The React bindings were a thin layer — a `useHMSStore` hook that subscribed to the store and triggered re-renders on changes. The Svelte bindings were equally thin. The store didn't care who was reading from it.
+
+This meant a React developer and a Svelte developer had the same mental model, the same selectors, the same actions. The only difference was the syntax:
+
+```typescript
+// React
+const peers = useHMSStore(selectPeers);
+
+// Svelte (reactive statement)
+$: peers = hmsStore.subscribe(selectPeers);
+
+// Vanilla JS
+hmsStore.subscribe(selectPeers, (peers) => {
+  renderPeerList(peers);
+});
+```
+
+Same store. Same selectors. Same behavior. Different wrappers.
+
+## Actions: The Other Half
+
+Reading state is half the experience. The other half is *doing things* — muting yourself, sending a message, changing someone's role. These had to feel just as clean:
+
+```typescript
+const hmsActions = useHMSActions();
+
+// Toggle your audio
+await hmsActions.setLocalAudioEnabled(false);
+
+// Send a message
+await hmsActions.sendBroadcastMessage("hey everyone");
+
+// Change someone's role
+await hmsActions.changeRole(peerId, 'viewer');
+```
+
+Actions talk to the WebRTC layer and the signalling server. When an action succeeds, the store updates. When the store updates, subscribers re-render. One-way data flow — actions down, state up.
+
+### Why One-Way? Because Video Calls Are Chaos.
+
+If you've worked with React, this pattern is second nature — props flow down, events flow up, and the UI is a pure function of state. We borrowed that philosophy wholesale.
+
+The alternative — two-way binding, where components can directly mutate SDK state — sounds convenient until you think about what's actually happening. You've got 50 peers, each with tracks being managed by a media server, network conditions changing every second, and a signalling layer deciding who gets what quality. If a component could reach in and flip `track.enabled = false` directly, you'd have race conditions between the UI and the server. A peer mutes themselves at the same instant the server degrades their track. Who wins? Which state is real? Nobody knows. Debugging that at 2am during an outage is not a life I'd recommend.
+
+By enforcing one-way flow — actions are the *only* way to change state, and the store is the *only* source of truth — you get a system where state is always consistent and always auditable. The UI can't lie, because it can't make up its own version of reality. It just renders what the store says.
+
+The key here: **developers didn't need to know WebRTC to use this**. No ICE candidates. No SDP negotiation. No SRTP. You want to mute someone? Call `setRemoteTrackEnabled`. The SDK handles the rest. That's the deal.
+
+## The DX Payoff
+
+After all of this, the code to render a fully functional video tile went from ~80 lines of callback management to:
+
+```tsx
+function VideoTile({ peerId }) {
+  const peer = useHMSStore(selectPeerByID(peerId));
+  const videoTrack = useHMSStore(selectCameraStreamByPeerID(peerId));
+  const audioLevel = useHMSStore(selectPeerAudioByID(peerId));
+  const quality = useHMSStore(selectConnectionQualityByPeerID(peerId));
+
+  return (
+    <div className="tile">
+      <Video track={videoTrack} />
+      <span>{peer.name}</span>
+      <AudioIndicator level={audioLevel} />
+      <QualityBadge quality={quality} />
+    </div>
+  );
+}
+```
+
+No callbacks. No effects. No cleanup. No "is my state stale?" anxiety. The developer decides *what to show*. The store handles *keeping it current*.
+
+This is what I mean by "WebRTC in React lingo." You're not thinking about peer connections and media streams. You're thinking about components and state. The way you already think about every other part of your app.
+
+## What I'd Tell You Over Coffee
+
+**Your domain's state is just state.** It doesn't matter if it comes from a REST API, a WebSocket, or a WebRTC peer connection. If you can describe its shape, you can put it in a store. The patterns already exist — selectors, subscriptions, normalization, one-way data flow. You don't need to invent new ones for real-time.
+
+**The framework-agnostic layer is worth the effort.** It feels like over-engineering when you start. It pays for itself the first time someone asks "does this work with Svelte?" and you say yes without rewriting anything.
+
+**Selectors aren't a nice-to-have in high-frequency state.** In a CRUD app, you can get away with subscribing to everything. When your state updates 200 times a second, every unnecessary re-render is a dropped frame, a frozen video, a laggy interaction. Granular subscriptions are the tax you pay for smooth real-time UI.
+
+**Good DX is invisible.** Nobody tweets about how great your state management is. They tweet about how easy it was to build a video call feature in an afternoon. That's the compliment. The best abstraction is the one the developer doesn't notice — they just build their UI and it works.

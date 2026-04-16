@@ -1,0 +1,90 @@
+---
+title: "Hey LLM, Show Your Work — Chain of Thought in Practice"
+date: "2026-02-24"
+description: "We needed an LLM to extract structured fields from messy phone call transcripts. The model was confidently wrong in ways we didn't catch for weeks. Here's how CoT fixed it."
+tags: ["LLM", "Prompt Engineering", "AI"]
+---
+
+We had a simple job for an LLM: read a phone call transcript, extract structured fields — patient name, drug name, event description — and return JSON.
+
+The first prompt was straightforward. "Here's a schema. Here's a transcript. Extract the fields." It worked. 85% of the time.
+
+The other 15% was the problem.
+
+## The Subtle Failures
+
+The model wasn't failing in obvious ways. It wasn't returning garbage or refusing to answer. It was being *confidently plausible* — filling in values that looked right at a glance but were wrong in ways that took domain experts to catch.
+
+A few greatest hits:
+
+**The phantom drug name.** A patient says "sent as" during a call. The speech-to-text transcribes it faithfully. The LLM extracts `product_trade_name: "Pentasa"` — a real drug that sounds similar. The patient was never on Pentasa. They were just saying "sent as" in a sentence about shipping.
+
+**The OOM misclassification.** A patient calls asking about financial assistance for their medication. The LLM outputs `event_description: "PT OOM"` — patient out of medication. Technically adjacent. The patient *might* run out eventually. But "calling about affordability" and "has run out of medication" are clinically different classifications with different reporting requirements.
+
+**The verbose narrator.** A patient tells a long story about their medical history, their family, their dog. The LLM faithfully summarizes the entire story in a paragraph. The field needed 1-2 sentences capturing the core health event. Nobody reviewing 200 extractions per day has time to read a paragraph per field.
+
+Every one of these passed a spot check. You'd have to read the original transcript side-by-side with the extraction to catch them. At scale, they slipped through.
+
+## The Fix: Show Your Work
+
+The change was small. Instead of "extract the value," we told the model to think step by step:
+
+```
+For each field:
+1. Find the relevant transcript segment — quote it with timestamps
+2. Reason about what value to extract based on the field description
+3. Extract the value, or set to null if not present
+
+Return a JSON object where each field has a "reason" and "value".
+```
+
+With an example:
+
+```json
+{
+  "patient_full_name": {
+    "reason": "[1:23] REPORTER: 'my name is john david smith' — Reporter explicitly states full name.",
+    "value": "John David Smith"
+  },
+  "event_description": {
+    "reason": "[0:45] REPORTER: 'i've been out of my medication for two weeks now' — Reporter is OOM.",
+    "value": "PT has been OOM for two weeks."
+  },
+  "lot_number": {
+    "reason": "No lot number or batch number is mentioned anywhere in the transcript.",
+    "value": null
+  }
+}
+```
+
+That's it. That's the whole change.
+
+## Why It Worked
+
+Three things happened:
+
+**1. The model started citing sources.** Before CoT, the model would output `"Pentasa"` and we'd have no idea where it found that. After CoT, the reason field would say `[3:42] CALLER: 'it was sent as a package'` — and now it's obvious the model misheard "sent as" as a drug name. The citation makes the error visible.
+
+**2. The reasoning caught its own mistakes.** This is the part that surprised us. The model would start writing the reason — "Reporter mentions being unable to afford..." — and then *not* classify it as OOM, because the act of reasoning through the context forced it to distinguish between "can't afford" and "ran out." The chain of thought isn't just for our benefit. It's a self-correction mechanism.
+
+**3. Nulls became confident.** Before CoT, the model would sometimes hallucinate a value rather than return null — as if leaving a field empty felt wrong. After CoT, the example explicitly showed a null with reasoning: "No lot number is mentioned anywhere in the transcript." Giving the model permission to say "it's not there" — with a reason — made it comfortable doing so.
+
+## The Audit Trail Side Effect
+
+We didn't plan this, but the `reason` field turned out to be almost more valuable than the `value` field.
+
+When an extraction looks wrong, you don't have to re-read a 30-minute transcript to figure out why. The reason tells you: here's the line the model looked at, here's how it interpreted it. Debugging went from "listen to the whole call again" to "read the reason, find the mistake, fix the prompt."
+
+It also made prompt iteration faster. When a field consistently extracts wrong, you read the reasons, spot the pattern, and know exactly what to add to the field description. The OOM misclassification? We added: "Only use 'PT OOM' if PT explicitly states they have run out. Do NOT use OOM if PT is seeking financial assistance." That rule came directly from reading a batch of wrong reasons.
+
+## The Tradeoff
+
+More tokens. The response is roughly 3x larger with reasons included. For 200 extractions per day, that's meaningful cost. We accepted it because the accuracy improvement and debuggability were worth more than the token savings.
+
+If you're running extractions at massive scale — millions per day — you might use CoT during evaluation and strip it in production. For us, the volume was low enough that always-on reasoning was the right call.
+
+## The Takeaway
+
+Chain of Thought isn't a research trick. It's a practical debugging and accuracy tool. If your LLM is extracting structured data and you're not asking it to show its reasoning, you're flying blind. The model will be wrong in ways that look right, and you won't know until a domain expert catches it — or worse, until nobody catches it.
+
+Make the model cite its sources. Make it reason before it answers. Read the reasons when it's wrong. Fix the prompt based on what the reasons tell you. That's the loop. It's not glamorous, but it works.

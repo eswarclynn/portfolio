@@ -1,0 +1,213 @@
+---
+title: "A Function That Runs for Weeks — Discovering Temporal"
+date: "2026-03-10"
+description: "I'd never used a workflow orchestration engine before. Then I had to build workflows that run for weeks, wait for humans, and survive deployments. Here's what I learned."
+tags: ["Temporal", "Go", "Workflow Orchestration", "Backend"]
+---
+
+I'd never heard of Temporal before joining this project. The codebase already used it. My first task was adding a feature to an existing workflow. I opened the code, saw what looked like a normal Go function, and thought — how hard can this be?
+
+Three months later, I have opinions.
+
+## What Even Is Temporal?
+
+If you've never encountered it either, here's the elevator pitch: Temporal lets you write long-running workflows as regular code — if/else, loops, function calls — and the platform guarantees they'll run to completion, even through crashes, deploys, and restarts.
+
+That sounds abstract. Let me make it concrete.
+
+We process pharmaceutical quality complaints. A complaint comes in, we extract data, submit a report to the manufacturer, and wait for them to acknowledge it. Then there might be a back-and-forth email exchange — they ask for more info, we respond, they confirm. Eventually, someone marks it complete.
+
+That whole process takes **weeks**. Not seconds. Not minutes. Weeks.
+
+Now try implementing that with a normal backend. You'd need a state machine, a database to persist state, a cron job to check for timeouts, a queue for async steps, retry logic for every external call, and a prayer that your deploy doesn't corrupt in-flight processes. I've built systems like that before. They work until they don't, and when they don't, debugging is archaeology.
+
+Temporal replaces all of that with: write a function.
+
+## The Workflow Is Just a Function
+
+Here's the mental model that made it click for me. A Temporal workflow is a Go function that can pause and resume:
+
+```go
+func PQCWorkflow(ctx workflow.Context, input PQCInput) error {
+    // Extract fields from the transcript
+    err := workflow.ExecuteActivity(ctx, ExtractFields, input).Get(ctx, &extracted)
+
+    // Submit the report to the manufacturer
+    err = workflow.ExecuteActivity(ctx, SubmitForm, extracted).Get(ctx, &submission)
+
+    // Wait for the manufacturer to acknowledge — could be days
+    var ack AckSignal
+    workflow.GetSignalChannel(ctx, "ack-received").Receive(ctx, &ack)
+
+    // Mark complete
+    return workflow.ExecuteActivity(ctx, MarkComplete, ack).Get(ctx, nil)
+}
+```
+
+That `Receive` call on the signal channel? The workflow literally pauses there. It's not polling. It's not a cron job checking a database. The function is suspended, and Temporal will resume it when the signal arrives — whether that's in 5 minutes or 5 weeks.
+
+The server can restart. The container can die and reschedule. The code can be redeployed. When the signal arrives, Temporal replays the workflow history, fast-forwards to where it left off, and continues. Your function doesn't know anything happened.
+
+That was the first "oh" moment.
+
+## Activities: Where the Real World Lives
+
+Temporal makes a hard distinction between **workflows** (deterministic logic, no side effects) and **activities** (the messy stuff — API calls, database writes, emails).
+
+Workflows are pure. Given the same input and history, they produce the same result. That's how Temporal can replay them safely.
+
+Activities are where you talk to the outside world:
+
+```go
+func SubmitForm(ctx context.Context, data FormData) (FormResponse, error) {
+    // This calls an external API — it might fail, timeout, or return garbage
+    resp, err := pqcAgent.SubmitToManufacturer(data)
+    if err != nil {
+        return FormResponse{}, err
+    }
+    return resp, nil
+}
+```
+
+If an activity fails, Temporal retries it automatically based on your retry policy. If it keeps failing, the workflow can handle the error — send a notification, try a different path, or escalate to a human. The retry logic isn't something you bolt on. It's built into the model.
+
+This separation took a minute to internalize. My first instinct was to put HTTP calls directly in the workflow function. Temporal's compiler doesn't stop you, but the replayer will punish you — non-deterministic operations in a workflow mean replays produce different results, which means corrupted state. Once I understood *why* the separation exists, it became second nature.
+
+## Signals: Poking a Running Workflow
+
+This is where Temporal gets really interesting for human-in-the-loop systems.
+
+Our workflows don't just run to completion autonomously. Humans interact with them — an agent marks a case as duplicate, a supervisor edits an extracted field, a manufacturer responds via email. Each of these is a **signal** sent to a running workflow:
+
+```go
+// In the workflow — waiting for one of several things to happen
+selector := workflow.NewSelector(ctx)
+
+selector.AddReceive(markCompleteChannel, func(ch workflow.ReceiveChannel, more bool) {
+    // Agent marked this case as done
+    ch.Receive(ctx, &completeSignal)
+    state = "completed"
+})
+
+selector.AddReceive(updateOutputChannel, func(ch workflow.ReceiveChannel, more bool) {
+    // Someone edited a field — re-process through the AI agent
+    ch.Receive(ctx, &updateSignal)
+    workflow.ExecuteActivity(ctx, UpdateField, updateSignal)
+})
+
+selector.AddReceive(ackReceivedChannel, func(ch workflow.ReceiveChannel, more bool) {
+    // Manufacturer acknowledged the report
+    ch.Receive(ctx, &ackSignal)
+    state = "acknowledged"
+})
+
+selector.Select(ctx) // Block until ANY of these signals arrive
+```
+
+The selector pattern is like a `select` statement in Go, but for workflow signals. The workflow sits there, dormant, potentially for weeks, until something happens. No polling. No cron. No database checks. Just a function waiting.
+
+From the outside — an API endpoint, a webhook handler, an email processor — you send a signal:
+
+```go
+temporal.SignalWorkflow(ctx, workflowID, "", "ack-received", ackData)
+```
+
+The workflow wakes up, processes it, and either completes or goes back to waiting.
+
+## Child Workflows: Breaking It Down
+
+Our main workflow spawns child workflows for specific phases. An email exchange with a manufacturer is a child workflow. A portal submission session is a child workflow.
+
+```go
+// Start a portal session as a child workflow
+future := workflow.ExecuteChildWorkflow(ctx, PortalSessionWorkflow, portalInput)
+
+// The parent can keep doing other things — or wait
+var result PortalResult
+err := future.Get(ctx, &result)
+```
+
+Why not just put everything in one big workflow? Because different phases have different lifecycles. A portal session might timeout in 10 minutes. The parent workflow might run for weeks. If the portal session fails, you want to retry just that part, not replay the entire workflow from the beginning.
+
+It's the same principle as function decomposition — break things into units with clear inputs, outputs, and failure modes.
+
+## The Things That Tripped Me Up
+
+**Determinism is strict.** You can't use `time.Now()` in a workflow — Temporal has `workflow.Now()`. You can't use random numbers — there's `workflow.SideEffect()`. You can't spawn goroutines with `go` — there's `workflow.Go()`. Every standard library call that touches the outside world has a Temporal equivalent that's replay-safe. The first week was just finding these landmines.
+
+**Testing is good, actually.** Temporal has a test framework that lets you mock activities and simulate signals. You can test "what happens if the manufacturer takes 3 days to respond, then sends a bounce, then responds again" without waiting 3 actual days. The test environment compresses time and lets you assert on workflow state at any point.
+
+```go
+env.RegisterDelayedCallback(func() {
+    env.SignalWorkflow("ack-received", ackData)
+}, time.Hour * 72) // Simulate ack arriving after 3 days
+
+env.ExecuteWorkflow(PQCWorkflow, input)
+```
+
+Being able to simulate multi-week workflows in milliseconds during tests was a game-changer. Without it, you're deploying and praying.
+
+**Non-retryable vs retryable errors matter.** If an activity returns an error, Temporal retries it. If the error is permanent (bad input, not found, validation failure), you don't want retries — you want the workflow to handle it. Wrapping errors as non-retryable is the escape hatch:
+
+```go
+return temporal.NewNonRetryableApplicationError("case not found", "NOT_FOUND", err)
+```
+
+Getting this wrong means a permanent failure retries forever, burning resources and filling up logs. Ask me how I know.
+
+## Deploying New Code While Workflows Are Running
+
+This is the part nobody warns you about.
+
+Your workflows run for weeks. You deploy code every day. What happens to the workflows that are already mid-execution when you push a change?
+
+Here's the problem: Temporal replays workflow history to rebuild state. It re-runs your workflow function from the beginning, fast-forwarding through recorded events. If the code it's replaying has changed — you added a new activity call, removed a step, changed the order — the replay doesn't match the history. Temporal panics. Your workflow is stuck.
+
+Imagine you have 200 workflows in flight, all at different stages. You can't just change the code and deploy. You'd break every in-flight workflow whose history doesn't match your new code path.
+
+The solution is **version gating**:
+
+```go
+v := workflow.GetVersion(ctx, "add-portal-submission", workflow.DefaultVersion, 1)
+
+if v == 1 {
+    // New code path — workflows started after this deploy
+    workflow.ExecuteActivity(ctx, SubmitViaPortal, data)
+} else {
+    // Old code path — workflows started before this deploy
+    workflow.ExecuteActivity(ctx, SubmitViaEmail, data)
+}
+```
+
+`GetVersion` checks: was this workflow started before or after the change? Old workflows take the old path. New workflows take the new path. Both replay correctly because each follows the code that matches its history.
+
+It's like maintaining backward compatibility, but for your own code, against your own running processes. Every breaking change needs a version gate. Every version gate adds a branch that you can't remove until all old workflows have completed — which, remember, could be weeks.
+
+This gets messy fast. You end up with nested version checks, gates that depend on other gates, and a growing urge to just let the old workflows drain. We've had PRs where half the diff is version gates for a three-line feature change.
+
+The discipline it forces is real though. You stop thinking about deploys as "replace old code with new code" and start thinking about them as "introduce new behavior while honoring old behavior." It's the same mindset as database migrations or API versioning, just applied to running business processes.
+
+My rule of thumb: if the change adds, removes, or reorders anything the workflow *does* (activity calls, signal handlers, child workflows), it needs a version gate. If it only changes what an *activity* does internally (different API call, different logic), no gate needed — activities aren't replayed.
+
+## Why Not Just a State Machine?
+
+I've built state-machine-in-a-database systems before. Table with a `status` column, a cron job that polls for work, a big switch statement that decides what to do next. They work.
+
+But they have failure modes that Temporal doesn't:
+
+- **Crash between state transitions.** Your cron picked up a job, called an API, the server crashed before updating the status. Now the job is stuck — or worse, it runs again and double-submits.
+- **Timeouts are manual.** "Wait 3 days for an ack" means a cron job running every hour checking timestamps. That's 72 unnecessary checks.
+- **Retry logic is DIY.** Every external call needs its own retry wrapper, backoff strategy, and failure handling.
+- **Debugging is log forensics.** When something goes wrong, you're piecing together what happened from log lines across multiple services.
+
+Temporal gives you a workflow history — a complete, ordered record of every event, signal, activity result, and state transition. When something goes wrong, you open the Temporal UI, look at the workflow, and see exactly what happened. It's like having `git log` for your business process.
+
+## What I'd Tell Past Me
+
+**Read the docs on determinism first.** Not the getting-started tutorial. The determinism constraints. Every confusing bug I hit in the first month was a determinism violation.
+
+**Signals are the superpower.** If your system involves "wait for something external to happen," signals are why you'd pick Temporal over simpler alternatives. The ability to have a function that sleeps for weeks and wakes up on an external event — with zero infrastructure on your end — is the killer feature.
+
+**Start with one workflow, feel the model.** Don't design your whole system upfront. Build one workflow end-to-end, hit the weird edges, understand the constraints, then expand. The mental model is simple but the implications take time to internalize.
+
+**It's just a function.** That's what I keep coming back to. All the power — retries, signals, persistence, replay — is invisible. You write a function. It runs for weeks. It survives restarts. It waits for humans. And in your code, it's just `if/else` and function calls. That's the whole trick.

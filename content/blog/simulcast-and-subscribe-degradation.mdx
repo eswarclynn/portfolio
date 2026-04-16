@@ -1,0 +1,173 @@
+---
+title: "Simulcast: A Tale of Smart Bandwidth Distribution"
+date: "2021-08-10"
+description: "Simulcast and subscribe degradation — the two features that make large video calls possible without your CPU catching fire."
+tags: ["WebRTC", "Simulcast", "Video Streaming", "Performance"]
+---
+
+![Kaththi simulcast meme — "The 720p video you're rendering on a tiny thumbnail is actually someone else's bandwidth"](/blog/simulcast-kaththi-meme.png)
+
+You're on a 50-person all-hands. Your manager is presenting Q3 results. You're nodding along, camera on, pretending to pay attention, when you notice something: 49 faces on your screen, all moving smoothly. No lag. No pixelation. Your laptop fan is quiet. Your battery isn't plummeting.
+
+Now think about what's actually happening. Your browser is receiving video from 49 people simultaneously. If everyone was sending 720p at 30fps, that's 49 × 1.5 Mbps = **73.5 Mbps of incoming video**. Your home WiFi probably tops out at 50 Mbps on a good day. Your laptop would sound like a jet engine trying to decode all of that. Chrome would eat so much RAM that your Slack would crash out of solidarity.
+
+And yet... the call is smooth. Your fan is silent. Chrome is only eating a *normal* amount of RAM.
+
+What sorcery is this?
+
+Two features you've never heard of: **simulcast** and **subscribe degradation**. They're the reason large video calls don't require a NASA-grade internet connection and a laptop you could fry an egg on.
+
+## The "Just Send Everything" Approach
+
+Let's start with the approach that would absolutely brick your laptop. Everyone sends one video stream. Everyone receives everyone else's stream. Full quality, all the time. Democracy. Equality. Communism, if you will.
+
+This works for 2 people. It's fine for 5. At 10, your laptop fan starts doing its impression of a helicopter. At 50, it's physically impossible for most connections and devices.
+
+The problem is twofold:
+
+1. **Bandwidth**: your internet connection has a ceiling. Downloading 49 HD streams exceeds most people's bandwidth. Your router didn't sign up for this.
+2. **CPU**: decoding video is expensive. Each stream costs CPU cycles. Your processor is already dealing with 47 Chrome tabs, Spotify, and whatever Electron app your company insists on. It doesn't need 49 simultaneous video decoders on top.
+
+Here's the thing though — you're rendering 44 of those people as tiny thumbnails at the bottom of the screen. Thumbnails that are maybe 80 pixels wide. You're downloading 720p video... to render it at 80 pixels. That's like buying a 4K TV to watch it from across the street.
+
+Nobody needs 720p on an 80-pixel thumbnail. That bandwidth belongs to someone else. *Aduthavanodathu*, as Vijay would say.
+
+## Simulcast: Send Three, Pick One
+
+Simulcast is elegant in concept. Instead of sending one video stream, each participant sends **three** — a high, medium, and low quality layer:
+
+```
+High:   1280×720  @ 30fps  (~1.5 Mbps)
+Medium:  640×360  @ 20fps  (~500 Kbps)
+Low:     320×180  @ 15fps  (~150 Kbps)
+```
+
+All three are encoded on the sender's side and sent to the media server (SFU). The server then decides which layer to forward to each recipient, based on what they actually need.
+
+The active speaker gets the high layer. The person you've pinned gets the high layer. The 40 people in tiny thumbnails at the bottom? They get the low layer. Nobody notices the thumbnails are 320×180 because the thumbnails are 80 pixels wide on screen.
+
+The math changes dramatically:
+
+```
+Without simulcast:
+49 streams × 1.5 Mbps = 73.5 Mbps incoming
+
+With simulcast:
+1 active speaker  × 1.5 Mbps  =  1.5 Mbps
+4 visible tiles   × 500 Kbps  =  2.0 Mbps
+44 thumbnails     × 150 Kbps  =  6.6 Mbps
+                         Total = ~10 Mbps
+```
+
+From 73.5 Mbps to 10 Mbps. Same 50 people. Same meeting you're pretending to pay attention to. Just smarter about who gets what quality.
+
+### The Sender's Cost
+
+"Wait, doesn't encoding three streams cost more for the sender?"
+
+Yes. Encoding three layers costs about 1.5-2x the CPU of encoding one. But the tradeoff is absurdly good — one person's CPU works a little harder so 49 people's laptops don't burst into flames. If that's not a good deal, I don't know what is.
+
+Modern hardware handles it fine. The layers share the same raw video frames — the camera only captures once. It's just the encoding that multiplies. And encoding 320×180 video is about as taxing as running a GIF.
+
+### Who Picks the Layer?
+
+The SFU (Selective Forwarding Unit) — the media server sitting between all participants — makes the layer selection. The client tells the server what it needs:
+
+```typescript
+// "I'm rendering this peer's video in a large tile"
+remoteVideoTrack.setPreferredLayer({ width: 1280, height: 720 });
+
+// "I'm rendering this peer's video in a tiny thumbnail"
+remoteVideoTrack.setPreferredLayer({ width: 320, height: 180 });
+```
+
+In practice, you don't even do this manually. The SDK watches the dimensions of the video element on screen and automatically requests the appropriate layer. Big tile? High layer. Small thumbnail? Low layer. Tile scrolled off screen? No layer at all — the SDK unsubscribes entirely.
+
+### The Priority List
+
+Not all streams are created equal. When bandwidth is limited, some streams matter more than others. The system allocates quality based on a priority hierarchy:
+
+1. **Screen share** — always gets the highest quality. If someone is sharing their screen, it's probably the thing everyone is looking at. A blurry screen share is useless — you can't read code, slides, or spreadsheets at 320×180. Screen share gets the high layer, non-negotiable.
+
+2. **Active speaker** — the person currently talking gets the high layer. Your eyes naturally go to whoever is speaking. If their video is crisp and everyone else is slightly lower quality, nobody notices.
+
+3. **Pinned tiles** — if a user explicitly pins someone's video (the presenter in a webinar, a sign language interpreter), that's a strong signal: "I want to see this person clearly." Pinned tiles get bumped up.
+
+4. **Visible tiles on screen** — the tiles currently rendered in the viewport get medium layers. Tiles that are scrolled off screen? They get nothing. Why would you burn bandwidth on video nobody can see?
+
+5. **Thumbnail tiles** — the gallery of small faces at the bottom. Low layer. 150 Kbps each. They're 80 pixels wide. Nobody is examining your pores from an 80-pixel tile.
+
+6. **Audio-only participants** — no video layer at all. They're just a name and an avatar. Zero bandwidth.
+
+This priority list is why a 50-person call with one screen share and one active speaker feels smooth on a mediocre connection. You're not actually downloading 50 streams at high quality. You're downloading 1-2 high, 4-5 medium, and a bunch of low — the rest are either thumbnails or off screen entirely.
+
+This is where the reactive state management pays off. The UI declares what it's rendering. The SDK observes the rendered size and context — screen share, active speaker, pinned, visible, hidden. The server sends the right quality for each. Nobody writes bandwidth optimization code. It just works.
+
+## Subscribe Degradation: When Even Simulcast Isn't Enough
+
+Simulcast solves the normal case. But what about the abnormal case?
+
+Your internet drops to 2 Mbps. Even with simulcast's optimized selection, 49 streams at low quality still exceeds your bandwidth. Or your CPU is pegged — maybe you have 30 other tabs open, maybe you're on a Chromebook, maybe you're running a build in the background.
+
+This is where **subscribe degradation** kicks in. It's the SDK's last line of defense: if the client detects it can't handle the incoming streams, it starts dropping video tracks entirely.
+
+The logic is prioritized:
+
+1. First, downgrade layers — switch high to medium, medium to low
+2. If that's not enough, unsubscribe from video tracks you're not actively looking at
+3. If that's *still* not enough, unsubscribe from more tracks, keeping only the active speaker
+
+The key insight: **a smooth low-quality experience is better than a stuttering high-quality one.** Nobody wants to watch a 1080p video that freezes every 2 seconds. They'd rather watch a crisp 360p video that plays smoothly.
+
+### Client-Side vs Server-Side
+
+We initially built subscribe degradation as a client-side feature. The SDK monitored its own health — packet loss, decode time, frame drops — and decided when to degrade. This is like asking someone who's drowning to also lifeguard themselves.
+
+Later, we moved the intelligence to the server. The SFU has a broader view — it knows the total available bandwidth for each participant, it knows which tracks are being decoded, it can make coordinated decisions across all subscribers. Server-side degradation was more reliable because the server isn't fighting for CPU cycles with the very streams it's trying to manage.
+
+The client still plays a role — it reports what's visible on screen, what tile sizes are rendered, which tracks are actively being watched. But the decision of *what quality to send* shifted to the server.
+
+### What the User Sees
+
+When degradation happens, the UX matters more than the engineering. A video tile that's been degraded could:
+
+1. Show a frozen last frame (is their camera off? did the call freeze? are they having a stroke? who knows!)
+2. Show a black rectangle (congratulations, you've given the user a panic attack)
+3. Show the peer's avatar with a subtle indicator (clear and calm)
+
+We went with option 3. When a track is degraded, the tile shows the peer's avatar — same as when their camera is off — with a small network quality indicator. The user sees "this person's video isn't available right now because of network conditions." Not scary. Not confusing.
+
+When conditions improve, the track is restored automatically. The avatar disappears, the video comes back. No user action required.
+
+```typescript
+const isDegraded = useHMSStore(selectIsTrackDegraded(trackId));
+const connectionQuality = useHMSStore(selectConnectionQualityByPeerID(peerId));
+
+return isDegraded ? (
+  <Avatar name={peer.name} quality={connectionQuality} />
+) : (
+  <Video track={videoTrack} />
+);
+```
+
+## The Metrics That Drive It
+
+Both simulcast and degradation are only as good as the metrics feeding them. You need to know, in real time:
+
+- **Available bandwidth**: how much can this participant's connection handle?
+- **Packet loss**: are packets being dropped? At what rate?
+- **Jitter buffer delay**: how much buffering is needed to smooth out packet arrival times?
+- **Decode time**: is the CPU keeping up with decoding?
+- **Frame drop rate**: are frames being dropped before they're rendered?
+
+These come from WebRTC's `getStats` API — which, if you've read my other post, you know is a delightful adventure in browser inconsistencies and spec changes. But once you have reliable metrics, the decisions become straightforward: if packet loss exceeds X%, downgrade. If decode time exceeds Y ms, unsubscribe a track. If available bandwidth drops below Z, switch layers.
+
+The thresholds took tuning. Too aggressive and you degrade unnecessarily on a momentary network blip. Too conservative and you let the call stutter for 5 seconds before reacting. We ended up with a system that responds within 1-2 seconds of sustained degradation — fast enough to prevent visible stuttering, slow enough to ignore transient dips.
+
+## The Invisible Feature
+
+Here's the thing about simulcast and subscribe degradation: when they work, you don't notice them. You join a 50-person call, your laptop doesn't catch fire, the active speaker looks sharp, the thumbnails look fine, and when your WiFi hiccups for a moment, one or two videos blink to avatars and come back a few seconds later.
+
+Nobody thinks "wow, the simulcast layer selection is really working well today." They just think "this call works." That's the goal. The best infrastructure is the kind you never think about.
+
+The only time you notice is when it's *not* there. Join a video call that doesn't have simulcast, with 20 people, and watch your CPU hit 100%. That's what "normal" used to look like. Simulcast and degradation didn't add a feature. They removed a problem.

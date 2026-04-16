@@ -1,0 +1,164 @@
+---
+title: "Settling the Blame Game in Video Calls"
+date: "2022-01-10"
+description: "WebRTC's getStats API has everything you need to measure call quality. It also has everything you need to lose your mind. Here's what we learned."
+tags: ["WebRTC", "Analytics", "Video Streaming", "Performance"]
+---
+
+"Your internet is bad."
+
+"No, YOUR internet is bad."
+
+Every video call argument ever. Two people, frozen screens, choppy audio, and absolutely no way to prove who's at fault. It's the tech equivalent of two Spider-Men pointing at each other.
+
+We needed to settle this scientifically. WebRTC has a `getStats` API that gives you low-level metrics about every connection, every track, every packet. Surely, we could just call it and get the answer.
+
+It took ~500 lines of code, browser-specific fallbacks, and a slowly deteriorating sense of optimism. But we got there.
+
+## The Five Numbers That Matter
+
+Before we dive into the pain, let's talk about what we're actually trying to measure. Out of the dozens of stats WebRTC exposes, five metrics tell you almost everything about call quality:
+
+**Packets Lost** — Data packets that were sent but never arrived. Audio packets lost = choppy, robotic voice. Video packets lost = pixelation and artifacts. Lower is better. Zero is the dream. Zero never happens.
+
+**Round Trip Time (RTT)** — How long a packet takes to go from you to the server and back. Below 150ms feels instant. Above 150ms, you start noticing delay. Above 300ms, you're having two separate monologues.
+
+**Bitrate** — Bits per second actively flowing over the connection. Your bandwidth caps this. If your call needs 5 Mbps and your connection can only do 3 Mbps, something's going to stutter. It's like trying to pour a bucket through a funnel — the funnel decides the flow rate.
+
+**Resolution** — The frame width, height, and frame rate of each video track. 1280×720 at 30fps is the sweet spot for most calls. But resolution adapts to conditions — if bandwidth drops, resolution drops with it. A screen share should always be higher resolution than a face — you need to read the text on a shared screen, but you don't need to count someone's pores.
+
+**Quality Limitation Reason** — This one's relatively new (Chrome-only when we first shipped it). It tells you *why* the quality degraded: `bandwidth` (your network can't handle it) or `cpu` (your device can't keep up). No more guessing.
+
+These five numbers, tracked over time, tell you: is the call good? If not, whose end is the problem? And what specifically is wrong?
+
+## The getStats API: Powerful and Painful
+
+WebRTC's `getStats` API gives you access to all of this. In theory.
+
+In practice, extracting useful metrics from `getStats` is like reading a novel where the chapters are shuffled, some pages are in a different language, and the author keeps rewriting it while you're reading.
+
+### Problem 1: Browser Imparity
+
+The same metric might be reported differently across browsers. Chrome gives you `qualityLimitationReason`. Firefox doesn't (or didn't, at the time). Safari reports some stats with different property names. A field that exists in Chrome Canary might not exist in Chrome stable.
+
+Your code ends up looking like this:
+
+```typescript
+// This shouldn't need to exist, but here we are
+function getPacketsLost(report) {
+  return report.packetsLost 
+    ?? report.packetsDiscarded 
+    ?? calculateFromPrevious(report)
+    ?? 0; // give up
+}
+```
+
+Every metric needs a fallback chain. Some metrics need entirely different calculation methods per browser. It's not a fun kind of cross-browser compatibility — it's the kind where you're reading spec drafts at midnight trying to figure out if `framesDropped` means the same thing in Safari as it does in Chrome. (It doesn't always.)
+
+### Problem 2: The Spec Is a Moving Target
+
+The WebRTC stats specification is a living document. Properties get added, renamed, deprecated. A field you relied on six months ago might be gone or renamed in the next browser update.
+
+Several properties were missing from TypeScript's interfaces entirely. You'd be writing code against stats that TypeScript didn't know existed, sprinkling `as any` like seasoning on bad food.
+
+You have to keep an eye on the spec, watch browser release notes, and update your code accordingly. It's maintenance work that never ends.
+
+### Problem 3: Related Stats Are Scattered
+
+The stats come in categorized reports:
+
+- `inbound-rtp` — stats about incoming audio/video streams
+- `outbound-rtp` — stats about outgoing audio/video streams
+- `remote-inbound-rtp` — how the server perceives your outgoing streams
+- `candidate-pair` — network path information
+- `codec` — encoding details
+- `transport` — connection-level stats
+
+Sounds organized. It's not. Related statistics are split across categories.
+
+You want to know the full picture of your outgoing video? You need `outbound-rtp` for bytes sent and resolution, `remote-inbound-rtp` for the round trip time and packet loss the server observed, and `candidate-pair` for the network path. Three different report types, correlated by IDs that you have to match manually.
+
+```typescript
+// To get a complete picture of one outgoing track:
+const outbound = reports.find(r => r.type === 'outbound-rtp' && r.trackId === trackId);
+const remoteInbound = reports.find(r => r.id === outbound?.remoteId);
+const candidatePair = reports.find(r => r.type === 'candidate-pair' && r.nominated);
+
+const fullPicture = {
+  bytesSent: outbound.bytesSent,
+  frameWidth: outbound.frameWidth,
+  frameHeight: outbound.frameHeight,
+  rtt: remoteInbound?.roundTripTime,
+  packetsLost: remoteInbound?.packetsLost,
+  localCandidate: candidatePair?.localCandidateId,
+};
+```
+
+It's a join operation. You're writing SQL queries against a stats API. Nobody asked for this.
+
+### Problem 4: You Can't Just Read the Numbers
+
+Here's the one that really got us. Some of the most useful metrics aren't directly available — you have to derive them.
+
+**Bitrate** is the best example. The `getStats` API gives you `bytesSent` and `bytesReceived` — cumulative totals since the connection started. That's not bitrate. Bitrate is *rate* — bytes per unit of time.
+
+To get bitrate, you have to:
+
+1. Call `getStats`, store the result
+2. Wait (we poll every second)
+3. Call `getStats` again
+4. Calculate: `(newBytes - oldBytes) / (newTimestamp - oldTimestamp)`
+
+```typescript
+// Every second:
+const prevReport = statsHistory.get(trackId);
+const currentReport = getLatestReport(trackId);
+
+const bitrate = (currentReport.bytesSent - prevReport.bytesSent) * 8 
+  / (currentReport.timestamp - prevReport.timestamp); // bits per second
+
+statsHistory.set(trackId, currentReport);
+```
+
+You're maintaining a history of previous stats, computing deltas, handling edge cases (what if the track was replaced? what if the timestamp went backwards because of a reconnection?), and doing this for every track, every second. That's where the 500 lines come from. Not from doing anything clever — from handling every boring edge case of periodic stat collection and aggregation.
+
+**Jitter buffer delay** is another derived metric. The raw stat gives you cumulative delay and a count of samples. To get the *average* jitter buffer delay, you compute the delta of both values between polls:
+
+```typescript
+const avgJitterBufferDelay = 
+  (current.jitterBufferDelay - prev.jitterBufferDelay) /
+  (current.jitterBufferEmittedCount - prev.jitterBufferEmittedCount);
+```
+
+Straightforward math, but if you get it wrong (dividing cumulative values instead of deltas, or getting the units wrong — it's in seconds, not milliseconds), your metrics are silently incorrect. And "silently incorrect metrics" is worse than no metrics at all, because you'll make bad decisions based on them.
+
+## From Metrics to Intelligence
+
+Five hundred lines of code to reliably extract these numbers. That's the price of admission. The real value comes from what you *do* with them.
+
+These metrics feed directly into the features that make calls better:
+
+- **Simulcast layer selection**: if available bandwidth drops, the server switches to a lower layer. Bitrate and packet loss drive that decision.
+- **Subscribe degradation**: if CPU can't keep up (high decode time, dropped frames), the SDK starts shedding video tracks. Quality limitation reason tells you whether it's bandwidth or CPU.
+- **Connection quality indicators**: that little green/yellow/red dot on each participant's tile? It's a composite of RTT, packet loss, and available bitrate.
+- **Adaptive encoding**: if the sender's upload bandwidth is limited, the encoder adjusts resolution and frame rate in real time. The outbound bitrate stats close the feedback loop.
+
+Without reliable metrics, all of these features are flying blind. You can't adapt to network conditions you can't measure.
+
+## Showing Stats to Users
+
+We also exposed these stats directly on video tiles — a "stats for nerds" overlay inspired by YouTube's version. Packet loss, bitrate, resolution, codec, jitter — all visible per track.
+
+This was surprisingly useful for debugging. When a customer reports "the call quality is bad," asking them to enable stats and send a screenshot gives you more signal than any amount of back-and-forth. "Oh, your packet loss is 15% — that's your network, not our SDK."
+
+Remember the "your internet is bad" / "no, YOUR internet is bad" argument? Now both people can pull up their stats. Argument settled. Data wins.
+
+## What I'd Do Differently
+
+**Abstract earlier.** We built the stats collection inline at first, then extracted it into a proper module. Should have been a module from day one. The cross-browser fallbacks and polling logic are generic — they don't belong next to feature code.
+
+**Mock the getStats API in tests.** We were slow to write tests for stats because the API is hard to mock — it returns a `Map` of typed objects with inter-dependent IDs. Once we built a proper mock that could simulate different browsers and edge cases, our confidence went way up.
+
+**Don't trust cumulative values.** Every time you see a cumulative counter in the stats API, your first instinct should be "I need to compute the delta." Every time we forgot that instinct, we shipped a bug where a metric grew unboundedly over the call duration and looked correct for the first 30 seconds.
+
+The 500 lines aren't glamorous. They don't appear in any demo. Nobody tweets about a well-implemented stats collection pipeline. But every feature that makes a video call adaptive, intelligent, and smooth starts with those 500 lines knowing, accurately and reliably, what's actually happening on the wire.

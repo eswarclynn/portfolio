@@ -1,0 +1,139 @@
+---
+title: "Reconnection in Video Calls: Solving the \"Hey, are you there?\""
+date: "2021-06-20"
+description: "Reconnection in video calls is nothing like reconnection in web apps. Here's what actually happens when your WiFi blips — and why it took us 3 years to get it right."
+tags: ["WebRTC", "Reconnection", "Networking", "Video Streaming"]
+---
+
+Your internet drops for 3 seconds. On a website, you'd barely notice — the page is already loaded, and your next click will just take a beat longer. On a chat app, your message goes out a few seconds late. Minor inconvenience.
+
+On a video call, those 3 seconds are chaos.
+
+Your audio cuts out mid-sentence. Your video freezes on an unflattering frame (it's always an unflattering frame). The other participants see you frozen, mouth half-open, looking like a buffering meme. When your connection comes back, you might rejoin seamlessly — or you might get kicked out entirely, staring at a "You've been disconnected" screen while your colleagues continue the meeting without you.
+
+Reconnection in video calls is one of those problems that sounds simple ("just... reconnect?") and turns out to be a multi-year engineering saga. We spent 3+ years iterating on it. Here's why it's so hard.
+
+## Why HTTP Reconnection Doesn't Apply
+
+When a REST API call fails, you retry it. The server doesn't care that you disconnected — it's stateless. Every request is independent. Reconnection is just "send the request again."
+
+WebRTC is the opposite. It's a persistent, stateful connection carrying real-time media streams. When you disconnect, you lose:
+
+- **The media streams** — your audio and video tracks are severed
+- **The peer connections** — the ICE candidates, DTLS handshakes, SRTP sessions
+- **The signalling channel** — the WebSocket that coordinates everything
+- **Your state on the server** — the SFU thinks you're still there, sending video to an empty chair
+
+And everyone else on the call *sees* your absence immediately. There's no "loading spinner" equivalent. You're just frozen. Or gone.
+
+## The Two Types of Reconnection
+
+Not all disconnections are the same. We deal with two fundamentally different scenarios:
+
+### ICE Restart: The Quick Fix
+
+ICE (Interactive Connectivity Establishment) is the protocol that figures out how to route media between you and the server. It tries different network paths — your local IP, your public IP via STUN, a relay via TURN — and picks the best one.
+
+When your network changes — WiFi to cellular, switching routers, a brief ISP hiccup — the current ICE path breaks, but the underlying session is still valid. You don't need to rejoin the call. You just need a new network path.
+
+An ICE restart renegotiates the path without tearing down the session. It's fast — usually 1-3 seconds — and invisible to the user. Their audio might glitch for a moment, but they stay in the call. No "reconnecting" spinner. No state loss.
+
+This is the happy path. Most brief disconnections are ICE restarts.
+
+### Full Reconnect: The Nuclear Option
+
+Sometimes the ICE restart fails. The WebSocket connection dies and can't be reestablished. The server times out your session. Your whole peer connection is gone.
+
+Now you need a full reconnect — essentially rejoining the call from scratch. New WebSocket connection. New signalling handshake. New ICE negotiation. New media streams. The server creates a new session for you, and other participants see you "leave" and "rejoin."
+
+This is the ugly path. It takes 5-10 seconds, the user sees a reconnecting state, and there's a visible disruption. But it's better than being kicked out permanently.
+
+## Detecting Disconnection: Harder Than You Think
+
+Before you can reconnect, you need to know you've disconnected. Sounds obvious. It's not.
+
+**`navigator.onLine` is a liar.** It tells you if your device has a network interface. It does not tell you if that interface can actually reach the internet. Your WiFi can be "connected" to a router that has no internet. `navigator.onLine` will happily say `true` while you can't reach a single server.
+
+**ICE connection state is the real signal.** WebRTC's peer connection has a `connectionState` that transitions through `connected` → `disconnected` → `failed`. But the timing of these transitions is browser-dependent. Chrome might report `disconnected` after 5 seconds. Firefox might wait 10. Safari does whatever Safari feels like doing that day.
+
+**The WebSocket is the early warning system.** In practice, the WebSocket connection to the signalling server usually dies before the ICE connection does. When the WebSocket drops, we start preparing for a reconnection even if ICE is still technically alive — because if the WebSocket is gone, we can't exchange signalling messages, and it's only a matter of time before ICE fails too.
+
+We ended up using a combination of all three signals, plus heartbeat timeouts, to detect disconnection reliably. Any single signal can lie. The ensemble doesn't.
+
+## The Retry Strategy
+
+Once we know we're disconnected, the retry dance begins.
+
+**Step 1: Try an ICE restart.** Quick and non-disruptive. If the network path changed but the session is still valid, this fixes it in 1-3 seconds.
+
+**Step 2: If ICE restart fails, try to reconnect the WebSocket.** The signalling server might still have our session. If we can re-establish the WebSocket, we can negotiate new ICE candidates without a full rejoin.
+
+**Step 3: If the WebSocket can't reconnect, full rejoin.** Drop everything, start fresh. New session, new tracks, new everything.
+
+Each step has exponential backoff with a **60-second hard timeout**. If we can't reconnect within 60 seconds, we give up and show the user a "disconnected" screen with a manual rejoin button. Why 60 seconds? Because after a minute of being disconnected from a video call, the conversational context is gone anyway. Silently rejoining after 2 minutes of absence is more confusing than a clean rejoin.
+
+## State Recovery: The Real Headache
+
+Reconnecting the transport is the easy part. The hard part is: what state should the user come back to?
+
+Think about everything that might have changed during those 3-30 seconds you were gone:
+
+- Were you muted before? You should come back muted.
+- Were you screen sharing? That stream is dead — do you restart it automatically or let the user decide?
+- Did someone send chat messages? Those are gone if they were only in memory.
+- Did the host change your role while you were disconnected? You might come back with different permissions.
+- Did new people join or old people leave? Your participant list is stale.
+
+For ICE restarts, this is mostly a non-issue — the session was never torn down, so state is preserved. For full reconnects, it's a minefield.
+
+Our approach: **preserve local intent, refresh remote state.** If you were muted, you come back muted — that's your local intent. If you were screen sharing, we don't auto-restart — that's a disruptive action that needs user consent. The participant list, chat history (stored server-side), and permissions are all refreshed from the server on rejoin.
+
+The track state recovery commit was one of the gnarliest PRs we shipped. Every combination of "what was I doing when I disconnected" × "what changed while I was gone" × "what should happen when I come back" is a test case. And getting even one wrong means a user comes back to a broken state — camera on when they thought it was off, audio playing from the wrong device, screen share stuck.
+
+## The Zombie Peer
+
+Here's a fun one. You disconnect. You reconnect. The server now has two copies of you — the old session that hasn't timed out yet, and the new session you just created. You're a zombie peer.
+
+Other participants might briefly see two of you in the call. Or the server might be sending media to your old, dead session while your new session gets nothing. Or your old session's tracks are still being forwarded to everyone, frozen on that flattering mid-sentence face.
+
+The fix: on reconnection, the server needs to match the new session to the old one, clean up the stale state, and transfer subscriptions. This has to happen atomically — there can't be a moment where both sessions are "live" simultaneously. Getting the server-side cleanup right was as important as getting the client-side reconnection right.
+
+## What the User Sees
+
+We went through several iterations of the reconnection UX:
+
+**V1: Toast notification.** A little banner saying "Reconnecting..." Subtle. Too subtle. Users didn't notice it, and would keep talking without realizing nobody could hear them.
+
+**V2: Full-screen spinner.** A big overlay: "Reconnecting to the call..." Too aggressive. A 2-second ICE restart doesn't need a full-screen takeover. Users thought the call had crashed.
+
+**V3 (what we shipped): Contextual reconnection state.** For ICE restarts (quick), a subtle indicator in the top bar — barely noticeable if it resolves in under 3 seconds. For full reconnects (slow), a more prominent overlay that appears only after 3+ seconds of disconnection. This way, quick blips are invisible, and real disconnections get appropriate visibility.
+
+We also added a connection quality indicator on the user's own tile — so you can see your own network quality and know *before* you disconnect that things are getting dicey. Prevention over cure.
+
+## The Edge Cases from Hell
+
+After 3 years, we've built a good mental catalog of the scenarios that break reconnection:
+
+**WiFi to cellular handoff.** Your phone switches from WiFi to cellular. Both ICE and WebSocket die simultaneously. The cellular connection takes a few seconds to stabilize, during which ICE restarts fail because the network isn't ready yet. You need to wait for the new network to be stable before attempting reconnection.
+
+**Laptop lid close/open.** You close your laptop, attend to something, open it 5 minutes later. The browser was suspended. All timers froze. The WebSocket is dead. ICE is dead. The server timed out your session minutes ago. This is always a full reconnect, and if the call has a time limit, it might have ended while you were gone.
+
+**Backgrounded mobile tabs.** Mobile browsers aggressively suspend background tabs. If you switch to another app during a call, the browser might freeze your JavaScript, pause your media tracks, and kill your WebSocket — all without triggering a proper disconnection event. When you come back, the call state is a mess. Reconnecting from a background resume is its own special adventure.
+
+**VPN connect/disconnect.** Your IP address changes. Every connection breaks. ICE restart works, but only if TURN servers are configured correctly to handle the IP change. Without proper TURN fallback, you get a full reconnect.
+
+Each of these is a test case. Each has been a production bug at least once. Some of them have been production bugs three times, with different root causes each time.
+
+## The Metric That Matters
+
+How do you measure reconnection quality? We settled on: **percentage of disconnections that recover without the user noticing.**
+
+If someone's WiFi blips for 2 seconds and the call continues smoothly — that's a win. If they see a reconnecting spinner but come back within 5 seconds — that's acceptable. If they get kicked out and have to manually rejoin — that's a failure.
+
+The goal is making the first category as large as possible. Every improvement to ICE restart speed, every new heuristic for detecting disconnection early, every optimization to state recovery — they all serve that one metric: make disconnections invisible.
+
+After 3 years: most brief disconnections (under 5 seconds) are completely invisible to the user. Longer disconnections (5-30 seconds) show a brief reconnecting state and recover automatically. Only sustained network failures (30+ seconds) result in a full disconnection.
+
+It's not perfect. It never will be — networks are inherently unreliable, and there will always be edge cases. But the difference between "your call dies every time your WiFi hiccups" and "your call survives everything short of an actual outage" is thousands of hours of engineering on a problem most people never think about.
+
+And that's the point. The best reconnection is the one you never notice happened.

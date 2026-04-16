@@ -1,0 +1,277 @@
+---
+title: "We Built a Whiteboard. Four Times."
+date: "2024-05-15"
+description: "From Excalidraw with Firebase to a custom canvas with gRPC and CRDTs — the story of building a collaborative whiteboard inside a video call, and why we kept starting over."
+tags: ["Whiteboard", "WebRTC", "tldraw", "gRPC", "Real-Time Collaboration"]
+---
+
+"Can we add a whiteboard?"
+
+Four words. Five years of my career. Well, not continuously — but the whiteboard kept coming back, like a feature that refuses to stay shipped. We built it four times. Each version worked. Each version eventually wasn't enough. Here's why.
+
+## Version 1: Excalidraw and Vibes (2021)
+
+The first whiteboard was a hackathon-energy project. We needed something collaborative inside video calls — teachers wanted to draw diagrams, interviewers wanted to sketch system designs, remote teams wanted to brainstorm.
+
+[Excalidraw](https://excalidraw.com/) was the obvious choice. Open source, beautiful, fast, and it had a collaboration API. We wrapped it into an npm package called `hms-excalidraw`, wired up Firebase for real-time sync, and shipped it.
+
+The first version broadcasted every element change to every peer. Every stroke, every cursor movement, every shape resize. Real-time? Sure. Performant? Not even slightly. With 10 people drawing simultaneously, the sync messages became a firehose. Cursors lagged. Elements appeared out of order. The Firebase bill didn't spark joy.
+
+We iterated fast:
+- Removed cursor broadcasting (it was the biggest bandwidth hog and nobody actually needed to see cursors in real time)
+- Switched to periodic sync instead of per-element broadcasting
+- Stripped out internationalization, infinite canvas, and other features we didn't need to reduce bundle size
+
+Over 14 published versions of `hms-excalidraw`, we got it to a usable state. It worked. Teachers used it. Interview platforms used it.
+
+But we were maintaining a fork of Excalidraw, fighting upstream updates, and our "package" was really just a wrapped open-source app with some props bolted on. The library wanted to own the whole page. We wanted it to sit politely inside a video call. These goals did not get along.
+
+## Version 2: tldraw + Pusher (2022)
+
+For v2, we swapped the drawing library and the sync layer simultaneously. Bold? Yes. But the problems were connected — we needed a library that was easier to embed *and* a sync layer that didn't require a Firebase instance per room.
+
+**Excalidraw to tldraw.** [tldraw](https://tldraw.dev/) was lighter, had cleaner APIs for programmatic control, and — critically — it was happy being a component. You gave it a store, it rendered shapes. You updated the store, it re-rendered. It didn't try to be the whole application. It just drew things.
+
+**Firebase to Pusher.** We moved real-time sync to [Pusher](https://pusher.com/). Private channels with authorization. Client-to-client messaging. Reconnection handling out of the box. The key insight: we used 100ms room IDs to route Pusher channels — same set of people in a video call, same whiteboard sync channel. No extra room-mapping logic needed.
+
+For shared state — tracking who opened the whiteboard, whether it's currently active — we used **peer metadata**. This was data attached to each peer in the 100ms room, visible to everyone. When a peer set `whiteboardOwner: true` in their metadata, every other peer's UI would render the whiteboard. Crude but effective. No extra signalling. No new API. Just metadata and conventions.
+
+```
+┌──────────────────────────────┐
+│      tldraw (rendering)      │
+├──────────────────────────────┤
+│   Pusher (element sync)      │
+├──────────────────────────────┤
+│ Peer Metadata (shared state) │
+├──────────────────────────────┤
+│    100ms SDK (video call)    │
+└──────────────────────────────┘
+```
+
+This version shipped well. It was the one I [wrote about on Twitter](https://x.com/clynndotts) — tldraw for rendering, Pusher for communication, peer metadata for state. It even won a Pusher developer contest.
+
+But look at that stack. Three separate services to draw a rectangle on someone else's screen. Pusher was another vendor to pay, another set of rate limits to watch, another potential point of failure at 3am. And the irony was thick — we were a *real-time communication company*. We had an entire infrastructure for syncing data between peers in a room. Why were we paying Pusher to do the same thing?
+
+## Version 3: tldraw + Our Own gRPC Service (2023-2024)
+
+The third version removed Pusher entirely. We replaced it with something we'd built in-house: **session store** — a real-time key-value store backed by gRPC.
+
+Session store started as a general-purpose feature: shared state across peers in a room. "Is recording active?" "What's the current poll?" "Who's the presenter?" Any key-value pair that all peers needed to agree on. It turned out to be a natural sync layer for whiteboard data — each shape is a key, its serialized state is the value, and changes stream to everyone.
+
+### Under the Hood: A Go gRPC Server
+
+The session store wasn't a microservice we jury-rigged from a Redis instance and some wishes. It was a proper gRPC service with a proto definition:
+
+```protobuf
+service Store {
+  rpc open(OpenRequest) returns (stream ChangeStream) {}
+  rpc get(GetRequest) returns (GetResponse) {}
+  rpc set(SetRequest) returns (SetResponse) {}
+  rpc delete(DeleteRequest) returns (DeleteResponse) {}
+  rpc count(CountRequest) returns (CountResponse) {}
+}
+```
+
+Five RPCs. The interesting one is `open` — a server-streaming RPC that keeps a long-lived connection open, pushing every key change as it happens. You call `open`, you get a stream. Every time someone draws a line on the whiteboard, a `ChangeStream` message shows up on every connected peer's stream. No polling. No short-lived connections. One persistent gRPC stream per peer.
+
+The backend was Go, backed by Redis for storage and pub/sub for fan-out. When peer A calls `set(key, value)`, the server writes to Redis, then publishes the change. Every peer with an open stream on that board gets the update through their existing connection. The server also handled authentication (JWT-based, with read/write/admin permission levels), payload size limits, board lifecycle management, and health monitoring through a shared internal gRPC framework.
+
+### Getting gRPC Into a Browser
+
+Browsers can't speak native gRPC. They can't open HTTP/2 connections to arbitrary backends the way a Go or Java client can. So we used [gRPC-Web](https://github.com/grpc/grpc-web) — a protocol that wraps gRPC calls in HTTP requests that browsers *can* make.
+
+The Go server wrapped the native gRPC service with `grpc-web` from the same process. HTTP/2 requests went straight through; HTTP/1.1 requests got CORS headers and the grpc-web treatment. Same port, same binary, both protocols.
+
+On the client side, we ran `protoc` to generate TypeScript types and a client from the same `.proto` file the server used:
+
+```typescript
+const transport = new GrpcWebFetchTransport({
+  baseUrl: endpoint,
+  meta: { Authorization: `Bearer ${token}` },
+});
+const client = new StoreClient(transport);
+```
+
+The generated client gave us typed methods for every RPC. `client.open()` returned a streaming call you could listen to. `client.set()` was a unary call that returned a promise. The proto was the contract. If the server changed the API, the generated client would fail to compile. No more "the server renamed a field and nobody updated the client."
+
+### tldraw Meets gRPC
+
+The whiteboard itself became a standalone app — a tldraw instance wrapped in a thin React shell, deployed separately and embedded into the video call UI via iframe. The hook that tied it all together was `useCollaboration`:
+
+1. On mount, call `open()` to start the gRPC stream
+2. Receive all initial records (the server sends every key in order)
+3. Hydrate the tldraw store from those records
+4. Listen for changes on the stream — apply them to the store via `store.mergeRemoteChanges()`
+5. Listen for local tldraw changes via `store.listen()` — sync them back to the session store via `set()`
+
+Local changes were throttled at 11ms. We learned that lesson from v1 — unthrottled shape updates during a freehand drawing path would produce hundreds of sync messages per second. 11ms was fast enough to feel real-time, slow enough to not melt the connection.
+
+```typescript
+store.listen(
+  throttle(({ changes }) => {
+    Object.values(changes.added).forEach(record =>
+      sessionStore.set(record.id, record)
+    );
+    Object.values(changes.updated).forEach(([, record]) =>
+      sessionStore.set(record.id, record)
+    );
+    Object.values(changes.removed).forEach(record =>
+      sessionStore.delete(record.id)
+    );
+  }, 11),
+  { source: 'user', scope: 'document' }
+);
+```
+
+Notice the `source: 'user'` filter — only sync changes the local user made. Remote changes that arrived through the gRPC stream and were applied via `mergeRemoteChanges` have `source: 'remote'` and don't trigger the listener. No echo loops. No infinite sync cycles. tldraw's event system made this clean.
+
+### Reconnection
+
+Networks are unreliable. The gRPC stream will drop. The question isn't *if* but *how gracefully you recover*.
+
+We built exponential backoff with jitter. When the stream errors, wait `currentDelay` before reconnecting. Each retry doubles the delay, capped at 30 seconds. Add +/-20% random jitter so 50 peers don't all reconnect at the exact same instant and thundering-herd the server.
+
+```typescript
+const jitter = delay * 0.2 * (Math.random() * 2 - 1);
+return Math.floor(delay + jitter);
+```
+
+And because people on laptops close the lid, go to a different room, come back, and expect the whiteboard to still work — we listened for the browser's `online` event. WiFi reconnects? Skip the backoff, reconnect immediately.
+
+This version also added proper role-based permissions. Hosts could draw. Viewers got a read-only tldraw instance locked to the hand tool — they could pan and zoom but not modify anything. The permissions came from the JWT token, which the session store server verified on every RPC call. A viewer couldn't `set()` even if they tried — the server's auth interceptor would reject it.
+
+```
+┌────────────────────────────────────────┐
+│   Whiteboard App (iframe, standalone)  │
+│   ┌────────────────────────────────┐   │
+│   │      tldraw (rendering)        │   │
+│   ├────────────────────────────────┤   │
+│   │  gRPC-Web Client (generated)   │   │
+│   └────────────┬───────────────────┘   │
+├────────────────┼───────────────────────┤
+│    100ms SDK   │  (video call, host)   │
+└────────────────┼───────────────────────┘
+                 │ HTTPS / gRPC-Web
+┌────────────────┼───────────────────────┐
+│   Session Store (Go gRPC server)       │
+│   ├── JWT Auth Interceptor             │
+│   ├── Redis (storage + pub/sub)        │
+│   └── Board lifecycle management       │
+└────────────────────────────────────────┘
+```
+
+No more Pusher. No more separate billing. The sync ran on the same infrastructure as the video call. A whiteboard was now just a "board" in the session store — created when a host opens it, destroyed when they close it, scoped to the room and session.
+
+## Version 4: Custom Canvas + Yjs (2026)
+
+The latest version is two rewrites in one. We replaced the rendering layer *and* the sync model.
+
+### Why Kill tldraw?
+
+tldraw was great. It was the right choice for v2 and v3. But our use cases outgrew what it offered:
+
+- **PDF import with navigation** — teachers import a slide deck and annotate over it, with page controls and a navigation overlay. tldraw doesn't know what a PDF is.
+- **Spotlight / follow-me mode** — the presenter controls what everyone sees, like a guided tour of the canvas. This requires broadcasting camera state across peers. tldraw's camera isn't designed to be externally controlled.
+- **Granular permissions** — not just draw/view, but per-tool controls. Some users can use the pen but not the eraser. Some can view but not pan. tldraw's permission model is binary.
+- **Math equation editor** — edtech use case. LaTeX rendering on a canvas. tldraw's shape system would need heavy extension.
+- **Flowchart shapes** — diagramming use case with connectors and auto-routing.
+- **Custom floating toolbar** — tldraw's UI wasn't customizable enough for our needs. We were hiding more of it than we were using.
+
+At some point, the code *around* the library exceeded the code *in* the library. The wrapper was bigger than the thing it wrapped. That's when a dependency becomes a liability — you're paying the complexity cost of an abstraction that no longer abstracts anything useful.
+
+### Building the Canvas
+
+The new whiteboard renders directly to a `<canvas>` element using the Canvas 2D API. No framework for drawing. No virtual DOM for shapes. Just `ctx.beginPath()`, `ctx.stroke()`, and a lot of math.
+
+The rendering pipeline has a few pieces that make it production-grade:
+
+**Virtualized rendering.** Only elements visible in the current viewport get drawn. A whiteboard can have thousands of shapes after a long session — a math teacher going through 40 slides will generate hundreds of annotations. Drawing all of them every frame would kill performance. The renderer checks each element's bounding box against the visible viewport and skips anything off-screen.
+
+**17 tool classes.** Pen, shapes, text, arrows, eraser, laser pointer, highlighter, sticky notes, image upload, math equations, flowcharts, frames, polygons, lines, selection, pan. Each tool is its own class with pointer-down/move/up handlers, preview rendering, and commit logic. The `ToolManager` routes input events to the active tool and handles tool switching.
+
+**State management with undo/redo.** A central `WhiteboardState` class holds all elements, the camera, and the current selection. Every mutation is tracked for history. Undo doesn't re-render the canvas from scratch — it replays the element state from the history stack.
+
+### Why Add Yjs?
+
+Here's the part that surprised me when I started on this version. v3's sync model — each shape is a key-value pair in the session store — worked, but it had a fundamental limitation: **last-write-wins**.
+
+If two people edit the same shape at the same time — say, one person moves a sticky note while another edits its text — one of those edits disappears. The last `set()` call to reach the server overwrites the previous one. For basic whiteboarding this was fine. Most people don't grab the same shape simultaneously. But for document annotation, where a presenter and a participant might both be interacting with the same area? It's a real problem.
+
+[Yjs](https://yjs.dev/) is a CRDT (Conflict-free Replicated Data Type) library. Instead of "whoever writes last wins," every peer maintains a local copy of the document, and concurrent edits are merged automatically. Two people move the same sticky note? Both moves are applied. Two people edit different properties of the same shape? Both edits survive. The math guarantees convergence — every peer ends up with the same state, regardless of the order operations arrive.
+
+We model the whiteboard as a `Y.Doc` with a `Y.Map` of elements. Each element is a nested `Y.Map` of properties. Points arrays (for freehand paths) are `Y.Array`s of `Y.Map`s. This granularity matters — Yjs can merge concurrent edits at the property level, not the element level.
+
+```typescript
+// Adding a shape to the CRDT
+doc.transact(() => {
+  const yElement = new Y.Map();
+  yElement.set('type', 'rectangle');
+  yElement.set('x', 100);
+  yElement.set('y', 200);
+  yElement.set('width', 300);
+  yElement.set('height', 150);
+  elements.set(elementId, yElement);
+});
+```
+
+The `CollaborationManager` sits between the local `WhiteboardState` and the `YjsDocument`. Local changes flow from state to Yjs (which broadcasts them). Remote changes arrive through Yjs and get applied to local state. An `isApplyingRemote` flag prevents echo loops — same principle as v3's `source: 'user'` filter, just at a different layer.
+
+### Three Sync Providers, One Interface
+
+v4 has a `SyncProvider` interface with three implementations. This was deliberate — we didn't want the sync transport baked into the whiteboard the way it was in v3.
+
+**1. WebSocket + Yjs protocol.** The "proper" Yjs sync. A WebSocket connection to a Yjs server that handles the sync protocol (state vectors, updates, awareness). This is what you'd use if you wanted the whiteboard to work outside of a 100ms video call — standalone collaborative editing.
+
+**2. HMS Session Store (gRPC).** The same session store from v3, adapted for v4's element model. Elements are stored with a `wb:el:` prefix, cursors with `wb:cursor:`. Each record includes a version number and `updatedBy` field for basic conflict detection. The gRPC client was rewritten — instead of protoc-generated code using `@protobuf-ts`, we hand-wrote the TypeScript types and client.
+
+Why hand-write them? The protoc-generated code pulled in the entire `@protobuf-ts/runtime` and `@protobuf-ts/grpcweb-transport` packages. For 5 RPC methods and a handful of message types, that's a lot of dependency for a whiteboard SDK that gets embedded in other people's apps. The hand-written client uses `fetch` directly — same endpoints (`/sessionstorepb.Store/set`, `/sessionstorepb.Store/open`), same JSON payloads, no codegen dependency.
+
+**3. BroadcastChannel (local testing).** Uses the browser's `BroadcastChannel` API to sync between tabs. No server required. Open two tabs, draw in one, see it in the other. Awareness (cursor positions) broadcasts every second, with stale cursors cleaned up after 5 seconds. This sounds trivial but it made development drastically faster — no need to spin up a backend to test sync behavior.
+
+```
+┌──────────────────────────────────────────────┐
+│              Whiteboard (custom canvas)       │
+│   ┌──────────────────────────────────────┐   │
+│   │          WhiteboardState             │   │
+│   │   (elements, camera, history)        │   │
+│   ├──────────────────────────────────────┤   │
+│   │       CollaborationManager           │   │
+│   │   (bridges state ↔ CRDT ↔ sync)     │   │
+│   ├──────────────────────────────────────┤   │
+│   │          YjsDocument (CRDT)          │   │
+│   ├──────────┬───────────┬───────────────┤   │
+│   │ WebSocket│ gRPC/HMS  │ Broadcast     │   │
+│   │ Provider │ Provider  │ Provider      │   │
+│   └──────────┴───────────┴───────────────┘   │
+└──────────────────────────────────────────────┘
+```
+
+The provider abstraction means the whiteboard doesn't care how its data gets to other peers. gRPC? WebSocket? BroadcastChannel? All three implement the same interface: `connect()`, `disconnect()`, `updateCursor()`, `updateSelection()`, `on(event, listener)`. The rendering layer and the sync layer are finally decoupled.
+
+### Awareness
+
+Cursors. Selections. Who's looking at what. "Follow me" mode where the presenter's camera drags everyone along. These are all *awareness* — ephemeral state that matters for the collaborative experience but isn't part of the document.
+
+The WebSocket provider uses Yjs's awareness protocol — each peer broadcasts their cursor position, selection, active state, and (for spotlight mode) their camera viewport. It's separate from the document sync and runs on a different cadence: awareness updates every frame, document syncs on edit.
+
+The gRPC provider stores cursors as session store keys with a `wb:cursor:` prefix, throttled at 50ms. Different transport, same abstraction. The `RemoteCursors` React component reads from the provider and renders colored dots with names — regardless of which provider is active.
+
+## What I'd Draw on the Whiteboard About All This
+
+Four versions. Five years. The rendering layer went from Excalidraw to tldraw to a custom canvas. The sync layer went from Firebase to Pusher to a gRPC session store to Yjs with pluggable transports. Each migration happened because the previous solution couldn't handle a new requirement.
+
+Here's what I'd actually put on the whiteboard if I had to summarize it all:
+
+**Start with a dependency, end with ownership.** Every version taught us what we actually needed. Excalidraw taught us about real-time sync challenges. Pusher taught us we wanted sync in-house. tldraw taught us the UX patterns that work. By v4, we had enough understanding to build it ourselves. Trying to build v4 first would have been a disaster — we didn't know enough.
+
+**Sync is the hard part, not drawing.** Rendering shapes on a canvas is a solved problem. Making those shapes appear on 50 screens simultaneously, in the right order, without conflicts, while someone is also on a laggy cellular connection in a hospital in rural India — that's where the engineering lives. Four versions, and the rendering layer was never the reason we rewrote. It was always sync.
+
+**The gRPC bet paid off.** Moving from Pusher to our own gRPC service in v3 felt like over-engineering at the time. But having a proper proto definition, generated clients, JWT auth, and Redis pub/sub meant the session store became a platform feature, not a whiteboard-specific hack. The same service now powers polls, shared state, and real-time reactions across the entire SDK. The whiteboard was just the first customer.
+
+**Throttle everything.** Every version of the whiteboard had a performance crisis caused by sending too many sync messages. v1's cursor broadcasting, v2's per-element updates, v3 and v4 both needed careful throttling of shape changes. The solution was always the same: batch and throttle. We just had to learn it four times. 11ms for shapes. 50ms for cursors. 200ms for page changes. These aren't magic numbers — they're the result of running calls with 30 people and watching where the sync falls apart.
+
+**The best version is the one that ships.** v1 was hacky. v2 had a third-party dependency we didn't love. v3 used an iframe. v4 is a full custom build with CRDTs. You know which one customers used the longest? v2 — the "imperfect" one with Pusher. It was stable, it was fast enough, and it shipped. Perfection is the enemy of a whiteboard that works.
+
+And yet — v4 exists because "works" isn't a permanent state. Requirements change. Scale changes. What was good enough for 10 customers drawing circles becomes inadequate for 10,000 teachers annotating PDFs with follow-me mode. You don't build v4 because v2 was bad. You build v4 because the world moved.
+
+We'll probably build a v5 someday. The whiteboard always comes back.

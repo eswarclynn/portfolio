@@ -1,0 +1,102 @@
+---
+title: "Feeling Out Browserbase"
+date: "2026-03-25"
+description: "We needed cloud browsers for portal automation. Browserbase had way more features than we expected. Here's what we tried, what we shipped, and what we left on the shelf."
+tags: ["Browser Automation", "Browserbase", "AI Agents"]
+---
+
+We needed to automate form submissions on portals that don't have APIs. The only interface is a login page and a web form. Two hundred times a day, across multiple portals, with different data each time.
+
+So we needed cloud browsers we could control with Playwright. That's how we found [Browserbase](https://www.browserbase.com). We went in expecting headless browser infrastructure. What we got was a toolbox with way more in it than we needed — and honestly, some of it was pretty cool even though we didn't end up using it.
+
+Here's the tour.
+
+## What We Actually Shipped
+
+The core of what we use is simple: spin up a browser session, control it with Playwright, fill forms, and hand off to a human for the final step. Browserbase handles the infrastructure — session isolation, scaling, recordings.
+
+The killer feature for us turned out to be **Live View**. You embed it as an iframe in your app, and your user sees a real Chrome session being automated in real time. Fields filling in, pages navigating, dropdowns selecting. When the bot is done, the user takes over — reviews the data, solves the CAPTCHA, clicks submit.
+
+Live View turned our automation from a black box into something people actually trust. That alone justified the choice.
+
+## The UX We Built Around It
+
+Browserbase gives you the browser. What you build around it is where the product decisions live.
+
+### Side-by-Side: Form Meets Portal
+
+The agent's screen is split in two. On one side, our form — the structured data extracted from the complaint, neatly laid out, editable. On the other side, the live Browserbase session showing the manufacturer's portal being filled in real time.
+
+This wasn't the first design. V1 was just the live view — full screen, watch the bot go. But agents kept switching tabs to cross-reference the original data. "Wait, what was the patient's date of birth again?" Tab switch. Tab switch back. Lost their place in the portal.
+
+Side-by-side solved it. The source of truth is right there next to the portal. You can glance left to verify what the bot is filling in on the right. No tab switching, no context loss. It sounds obvious in hindsight, but we only got there after watching agents actually use V1.
+
+### The Timer
+
+Browserbase sessions have a timeout. If nobody interacts with the session within a window, it expires. Early on, agents would start a portal submission, get pulled into a phone call, come back 20 minutes later, and find a dead session. All the work — gone.
+
+So we added a visible countdown. Time remaining until the session expires. Big enough to notice, not big enough to stress.
+
+It completely changed behavior. Agents now treat the portal step as a focused task. Start it, watch it, finish it. The timer creates just enough urgency — like a checkout timer on an e-commerce site, except instead of buying shoes, you're submitting a regulatory compliance form.
+
+We also added warnings. At 5 minutes remaining, the timer goes amber. At 2 minutes, red. Under a minute, it pulses. Nobody has missed a session timeout since.
+
+### The CAPTCHA Is the Handoff
+
+The bot fills every field. Then it stops. The CAPTCHA is untouched, the submit button unclicked. That's the agent's job.
+
+We could automate this too — Browserbase has CAPTCHA solving built in. But the CAPTCHA is our human-in-the-loop checkpoint. It's the moment where the agent reviews what the bot filled in, confirms the data is correct, and takes responsibility for the submission. In regulated healthcare, that final human verification isn't UX friction — it's the feature.
+
+The agent clicks into the live view, solves the CAPTCHA, scrolls through the form one last time, and hits submit. Ten seconds of human work after two minutes of automation. That's the ratio we're going for.
+
+### When It Breaks
+
+Portal automation is inherently brittle. Manufacturer updates their layout? Selectors break. New required field appears? Automation misses it. Their server is slow today? Timeouts.
+
+The retry flow: if the automation fails, it spins up a fresh Browserbase session and tries again. A few attempts before it gives up. When retries are exhausted, the agent gets a clear message — "Automation couldn't complete this one. Here's what we had. You'll need to do it manually."
+
+No silent failures. Either the agent watched it succeed, or they know exactly where it stopped. The worst possible outcome in our domain isn't a failed submission — it's a submission that *maybe* went through and nobody's sure.
+
+## What We Tried But Didn't Ship
+
+### Stagehand
+
+[Stagehand](https://github.com/browserbase/stagehand) is Browserbase's AI-powered web agent framework. Instead of writing Playwright selectors, you describe what you want in natural language:
+
+```typescript
+// Instead of this
+await page.click('#submit-btn-primary');
+
+// You write this
+await stagehand.act("click the submit button");
+```
+
+It uses vision models to understand the page and figure out what to click. For scraping unfamiliar sites or exploratory automation, this is genuinely powerful.
+
+We tried it. It worked. But for our use case — the same five portals, the same forms, hundreds of times a day — we didn't need AI to find the submit button. Plain Playwright selectors were faster, more predictable, and easier to debug when something broke.
+
+We'd reach for Stagehand if we were onboarding a portal we'd never seen before. For day-to-day automation on known forms, deterministic selectors win.
+
+### Advanced Stealth Mode
+
+Browserbase has a stealth mode — randomized fingerprints, realistic mouse movements, natural timing patterns. Built to get past bot detection.
+
+Some of our portals do have basic bot detection. Stealth mode handled it cleanly in testing. But we chose not to ship it. If a manufacturer's portal explicitly blocks bots, circumventing that detection isn't a great look during an audit. We'd rather get flagged and have a conversation than silently evade.
+
+For scraping or data aggregation where bot detection is a legitimate obstacle? Easy yes. For regulated healthcare? The compliance math didn't work out.
+
+### Auto CAPTCHA Solving
+
+Tested it. Worked well. Intentionally skipped — for the human-in-the-loop reason above. A product decision, not a technical one.
+
+## Session Recordings: The Sleeper Hit
+
+Every Browserbase session is recorded. We mostly use this for debugging — when an automation fails, we watch the replay instead of reading logs. Did the portal change its layout? Did a dropdown not load? Did the login fail?
+
+It doesn't sound exciting until you're debugging a failed submission at 11pm and instead of grepping through log files, you just *watch what happened*. Way faster. Way less painful.
+
+## The Verdict
+
+We use maybe 30% of what Browserbase offers. Cloud browser sessions, Playwright control, Live View, recordings. That's our stack. The AI features — Stagehand, CAPTCHA solving, stealth — are impressive and clearly where browser automation is heading. We just happen to be in a domain where predictability and compliance trump cleverness.
+
+The boring parts are really good though. And the product we built around those boring parts — the side-by-side view, the timer, the human handoff, the graceful failures — that's where the actual UX lives. Browserbase gives you a browser. What you wrap around it is what makes it a product.
