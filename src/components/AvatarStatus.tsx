@@ -75,9 +75,10 @@ const MAX_ROTATE = 14;
 /*  Main Component                                                     */
 /* ------------------------------------------------------------------ */
 export default function AvatarStatus() {
-  const [current, setCurrent] = useState<{ activity: Activity; label: string }>(
-    () => getActivity()
-  );
+  const [current, setCurrent] = useState<{
+    activity: Activity;
+    label: string;
+  } | null>(null);
   const [hovered, setHovered] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const lastMoveTime = useRef(0);
@@ -94,10 +95,15 @@ export default function AvatarStatus() {
   const rotateX = useSpring(rawRotateX, springCfg);
   const rotateY = useSpring(rawRotateY, springCfg);
 
-  /* Update every minute */
+  /* Set activity on mount (client only) and update every minute */
   useEffect(() => {
-    const id = setInterval(() => setCurrent(getActivity()), 60_000);
-    return () => clearInterval(id);
+    const update = () => setCurrent(getActivity());
+    const t = setTimeout(update, 0);
+    const id = setInterval(update, 60_000);
+    return () => {
+      clearTimeout(t);
+      clearInterval(id);
+    };
   }, []);
 
   /* Global mousemove — track proximity to avatar */
@@ -145,6 +151,8 @@ export default function AvatarStatus() {
     window.addEventListener("mousemove", onMouseMove);
     return () => window.removeEventListener("mousemove", onMouseMove);
   }, [onMouseMove]);
+
+  if (!current) return null;
 
   return (
     <div
