@@ -27,6 +27,10 @@ npm install
 npm run dev
 ```
 
+## Contributing
+
+PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
 ## License
 
-Do whatever you want with the code. The opinions in the blog posts are mine though — you can't have those.
+[MIT](LICENSE) — do whatever you want with the code. The opinions in the blog posts are mine though — you can't have those.
