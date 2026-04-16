@@ -44,7 +44,7 @@ export default function Navbar() {
           );
         })}
         <a
-          href="/Eswar_Prasad_Clinton-100ms_ai.pdf"
+          href="/Eswar_Prasad_Clinton_Resume.pdf"
           target="_blank"
           rel="noopener noreferrer"
           className="font-mono text-sm tracking-wide text-muted hover:text-foreground transition-colors duration-300"

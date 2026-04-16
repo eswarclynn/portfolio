@@ -26,6 +26,7 @@ const skillGroups: { category: string; skills: Skill[] }[] = [
       { name: "React", url: "https://react.dev" },
       { name: "Next.js", url: "https://nextjs.org" },
       { name: "Svelte", url: "https://svelte.dev" },
+      { name: "Relay", url: "https://relay.dev" },
       { name: "Tailwind CSS", url: "https://tailwindcss.com" },
     ],
   },
@@ -34,28 +35,33 @@ const skillGroups: { category: string; skills: Skill[] }[] = [
     skills: [
       { name: "Django", url: "https://www.djangoproject.com" },
       { name: "Node.js", url: "https://nodejs.org" },
-      { name: "Express", url: "https://expressjs.com" },
-      { name: "Rails", url: "https://rubyonrails.org" },
       { name: "GraphQL", url: "https://graphql.org" },
       { name: "gRPC", url: "https://grpc.io" },
     ],
   },
   {
+    category: "AI & Automation",
+    skills: [
+      { name: "LLM Agents" },
+      { name: "Playwright", url: "https://playwright.dev" },
+      { name: "Browserbase", url: "https://www.browserbase.com" },
+      { name: "RPA" },
+    ],
+  },
+  {
     category: "Infrastructure",
     skills: [
+      { name: "Temporal", url: "https://temporal.io" },
       { name: "WebRTC", url: "https://webrtc.org" },
       { name: "WebSocket" },
-      { name: "Temporal", url: "https://temporal.io" },
-      { name: "Protobuf", url: "https://protobuf.dev" },
-      { name: "Video Streaming" },
-      { name: "CDN" },
+      { name: "Video Streaming (HLS, CDN, ABR)" },
     ],
   },
   {
     category: "Data",
     skills: [
-      { name: "MongoDB", url: "https://www.mongodb.com" },
       { name: "PostgreSQL", url: "https://www.postgresql.org" },
+      { name: "MongoDB", url: "https://www.mongodb.com" },
       { name: "Redis", url: "https://redis.io" },
     ],
   },
